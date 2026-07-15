@@ -15,6 +15,8 @@ class LogitLensCapture:
     token_id: int
     token_str: str
     proba_value: float
+    logit_value: float
+    entropy: float
 
     # def __repr__(self):
     #     return f"LogitLensCapture(layer_name={self.layer_name}, position_idx={self.position_idx}, token_rank={self.token_rank}, token_id={self.token_id}, token_str='{self.token_str}', proba_value={self.proba_value})"
@@ -43,20 +45,27 @@ class LogitLens:
         assert bsz == 1, "Batch size > 1 not supported"
         probas = torch.softmax(logits, dim=-1)
         topk_values, topk_indices = torch.topk(probas, k=self.topk, dim=-1)
-        captures = [] 
+        topk_logits = logits.gather(-1, topk_indices)
+        # Shannon entropy in bits (log2), (bsz, seq_len)
+        entropies = -(probas * torch.log2(probas.clamp_min(1e-12))).sum(dim=-1)
+        captures = []
         for i in range(seq_len):
             print(".", end="")
+            entropy_value = entropies[0, i].item()
             for j in range(self.topk):
                 token_id = topk_indices[0, i, j].item()
                 token_str = self.tokenizer.decode([token_id], skip_special_tokens=False)
                 proba_value = topk_values[0, i, j].item()
+                logit_value = topk_logits[0, i, j].item()
                 captures.append(LogitLensCapture(
                     layer_name=layer_name,
                     position_idx=i,
                     token_rank=j,
                     token_id=token_id,
                     token_str=token_str,
-                    proba_value=proba_value
+                    proba_value=proba_value,
+                    logit_value=logit_value,
+                    entropy=entropy_value
                 ))
         return captures
 
@@ -103,7 +112,7 @@ class LogitLens:
         import matplotlib.pyplot as plt
 
         n_layers, n_positions = len(passes), len(positions)
-        proba_matrix = np.full((n_layers, n_positions), np.nan)
+        entropy_matrix = np.full((n_layers, n_positions), np.nan)
         token_matrix = [["" for _ in range(n_positions)] for _ in range(n_layers)]
 
         row_labels = []
@@ -114,22 +123,23 @@ class LogitLens:
             for j, pos in enumerate(positions):
                 c = pos_map.get(pos)
                 if c is not None:
-                    proba_matrix[i, j] = c.proba_value
+                    entropy_matrix[i, j] = c.entropy
                     token_matrix[i][j] = c.token_str
 
-        fig, ax = plt.subplots(figsize=(max(6, n_positions * 1.5), max(4, n_layers * 0.5)))
+        vmax = np.nanmax(entropy_matrix) if not np.all(np.isnan(entropy_matrix)) else 1.0
+        fig, ax = plt.subplots(figsize=(max(6, n_positions * 2.5), max(4, n_layers * 0.4)))
         # origin="lower": row 0 (earliest pass) at the bottom, later passes
         # stack upward -- matches processing order bottom-to-top.
-        im = ax.imshow(proba_matrix, cmap="viridis", vmin=0, vmax=1, aspect="auto", origin="lower")
+        im = ax.imshow(entropy_matrix, cmap="viridis", vmin=0, vmax=vmax, aspect="auto", origin="lower")
 
         for i in range(n_layers):
             for j in range(n_positions):
                 token_str = token_matrix[i][j]
                 if not token_str:
                     continue
-                proba = proba_matrix[i, j]
-                text_color = "black" if proba > 0.5 else "white"
-                ax.text(j, i, token_str, ha="center", va="center", color=text_color, fontsize=8)
+                normalized_entropy = entropy_matrix[i, j] / vmax if vmax > 0 else 0.0
+                text_color = "white" if normalized_entropy < 0.5 else "black"
+                ax.text(j, i, token_str, ha="center", va="center", color=text_color, fontsize=6)
 
         ax.set_yticks(range(n_layers))
         ax.set_yticklabels(row_labels, fontsize=8)
@@ -145,7 +155,7 @@ class LogitLens:
         ax.set_xticklabels(xtick_labels, rotation=90, fontsize=8)
         ax.set_xlabel("Position")
 
-        fig.colorbar(im, ax=ax, label="Probability")
+        fig.colorbar(im, ax=ax, label="Entropy (bits)")
         fig.tight_layout()
         # Leave extra room on the left for the layer-name legend.
         fig.subplots_adjust(left=0.25)
@@ -163,17 +173,19 @@ if __name__ == "__main__":
 
     print(model)
     logit_lens = LogitLens(tokenizer, model.lm_head, topk=1)
+
+    # Option A: Individual transformer blocks
     for i, transformer_block in enumerate(model.model.L_module.layers):
-        if i == 15:
+        if i in [0,7,15]:
             layer_name = f"L_module_layers[{i}]"
             transformer_block.register_forward_hook(logit_lens.build_hook(layer_name=layer_name))
-    #model.model.L_module.final_norm.register_forward_hook(logit_lens.build_hook(layer_name="L_module_final_norm"))
-
     for i, transformer_block in enumerate(model.model.H_module.layers):
-        if i == 15:
+        if i in [0,7,15]:
             layer_name = f"H_module_layers[{i}]"
             transformer_block.register_forward_hook(logit_lens.build_hook(layer_name=layer_name))
-    #model.model.H_module.final_norm.register_forward_hook(logit_lens.build_hook(layer_name="H_module_final_norm"))
+
+    #model.model.L_module.register_forward_hook(logit_lens.build_hook(layer_name="L_module"))
+    #model.model.H_module.register_forward_hook(logit_lens.build_hook(layer_name="H_module"))
 
     # synth,cot composite — reasoning / CoT style (see Disclaimer for other modes)
     condition = "<|quad_end|><|object_ref_end|>"
