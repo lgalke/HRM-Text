@@ -15,12 +15,22 @@ target positions -- and back-propagated to `h_l`; the resulting gradient is then
 *meaned* over source positions. Averaging that per-sequence estimate over the
 corpus gives `J_l`.
 
-Recurrence (HRM specific). HRM applies its L/H stacks repeatedly, so a given
-block fires several times per forward pass (for the 1B config: L-blocks 6x,
-H-blocks 2x). Exactly as in `logit_lens.py` / `geometry.py`, a Jacobian is
-therefore keyed by *invocation index* (the position of the hook fire within a
-forward), not by layer name. Firing counts are input-independent, so invocation
-indices line up across corpus sequences and the readout prompt; we assert this.
+Recurrence (HRM specific) -- one transport per *invocation*, not per layer.
+HRM applies its L/H stacks repeatedly, so a given block fires several times per
+forward pass (for the 1B config: L-blocks 6x, H-blocks 2x). The transport
+`J = d h_final / d h` is a property of *where an activation sits in the
+computation graph*, i.e. of everything downstream of it -- not of the producing
+weights. Because the same weights are reused at different depths, the SAME layer
+has a genuinely DIFFERENT Jacobian at each firing: L[0] in the first L-sweep has
+all remaining cycles between it and h_final (far from identity), while L[0] in
+the last sweep has almost nothing left (near identity). Collapsing these into one
+per-layer transport would average activations as computationally distant as an
+early and a late layer of a feedforward net -- the wrong thing. So, exactly as in
+`logit_lens.py` / `geometry.py`, a Jacobian is keyed by *invocation index* (the
+position of the hook fire within a forward). This is also the faithful
+generalization of the non-recurrent reference, which keys by position-in-graph
+(there == layer). Firing counts are input-independent, so invocation indices line
+up across corpus sequences and the readout prompt; we assert this.
 
 Everything here is self-contained except model loading, which is deferred to
 `utils.load_hrm` (shared with the other interp scripts).

@@ -33,14 +33,40 @@ Representations Form a Global Workspace in Language Models").
   (default `prefix`, i.e. `token_type_ids=1`, matching the other interp scripts),
   fit-or-load cache, then the same demo-prompt readout as `logit_lens.py`.
 
-## Recurrence handling
+## Recurrence handling — one transport per *invocation*, not per layer
 
 HRM applies its L/H stacks repeatedly, so a given block fires several times per
-forward (1B config: L-blocks 6×, H-blocks 2×). Exactly as in `logit_lens.py` /
-`geometry.py`, a Jacobian is therefore keyed by **invocation index** (the
-position of the hook fire within a forward), not by layer name. Firing counts are
-input-independent, so invocation indices line up across corpus sequences and the
-readout prompt; this is asserted.
+forward (1B config: L-blocks 6×, H-blocks 2×). This raises a design question:
+should there be a single transport matrix per layer, or a separate one per
+invocation of that layer?
+
+**Principled answer: per invocation.** The transport `J = ∂h_final/∂h` is *not* a
+property of a layer's weights — it is the linearized map from *an activation at a
+specific point in the computation graph* to the final hidden state, and it is
+governed by **everything downstream** of that point.
+
+- In a plain feedforward transformer, layer `l` sits at exactly one place in the
+  graph, so "per layer" and "per position-in-graph" coincide — which is why the
+  non-recurrent reference (`anthropics/jacobian-lens`) has one `J` per layer.
+- HRM reuses the *same weights* at different depths. L[0] in the **first** L-sweep
+  has all remaining cycles between it and `h_final` (Jacobian far from identity);
+  L[0] in the **last** sweep has almost nothing left (Jacobian near identity). So
+  `∂h_final/∂h` genuinely differs at each firing even though the producing weights
+  are identical.
+
+Collapsing invocations into a single per-layer transport would average
+activations as computationally distant as an early and a late layer of a
+feedforward net — the same category error as averaging the logit-lens readout
+across early and late layers. Keying by invocation is therefore the faithful
+generalization of the reference method (which keys by position-in-graph, which
+there equals the layer).
+
+**In the code.** `estimate_jacobians` keys `jacobians` by invocation index;
+`transport(residual, invocation)` selects `jacobians[invocation]`; and
+`build_hook` advances a per-firing counter so each firing uses its own `J`. Firing
+counts are input-independent, so invocation indices line up across corpus
+sequences and the readout prompt; this is asserted. `show()` renders each
+invocation as its own row.
 
 ## Two real subtleties handled
 
