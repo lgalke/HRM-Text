@@ -1,4 +1,3 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 
 from dataclasses import dataclass
@@ -301,11 +300,13 @@ def build_batches(seqs: Sequence[torch.Tensor], pad_id: int, batch_size=8,
 
 
 if __name__ == "__main__":
-    model_id = "sapientinc/HRM-Text-1B"
+    from utils import load_hrm
+
+    # A HF repo id / dir, or a native training checkpoint dir (auto-converted).
+    MODEL_SOURCE = "sapientinc/HRM-Text-1B"
     device = "cuda" if torch.cuda.is_available() else \
              ("mps" if torch.backends.mps.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16).eval().to(device)
+    model, tokenizer = load_hrm(MODEL_SOURCE, dtype=torch.bfloat16, device=device)
 
     geometry = GeometryProbe(center=True)
     for i, block in enumerate(model.model.L_module.layers):

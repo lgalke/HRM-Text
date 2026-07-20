@@ -14,7 +14,6 @@ position of the hook fire within a forward pass), which aligns across batches
 as long as every forward fires the hooks the same number of times.
 """
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 import numpy as np
 
@@ -248,7 +247,10 @@ def show(results: List[ProbeResult], baseline=0.5, select_on="val", title=None):
 
 
 if __name__ == "__main__":
-    model_id = "sapientinc/HRM-Text-1B"
+    from utils import load_hrm
+
+    # A HF repo id / dir, or a native training checkpoint dir (auto-converted).
+    MODEL_SOURCE = "sapientinc/HRM-Text-1B"
     device = "cuda" if torch.cuda.is_available() else \
              ("mps" if torch.backends.mps.is_available() else "cpu")
 
@@ -262,10 +264,9 @@ if __name__ == "__main__":
     # final measurement once you've settled on the setup.
     EVAL_TEST = False
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model, tokenizer = load_hrm(MODEL_SOURCE, dtype=torch.bfloat16, device=device)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16).eval().to(device)
 
     collector = ResidualCollector(pool=POOL)
     for i, block in enumerate(model.model.L_module.layers):

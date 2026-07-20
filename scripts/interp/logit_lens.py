@@ -1,4 +1,3 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 
 
@@ -164,12 +163,11 @@ class LogitLens:
 
 
 if __name__ == "__main__":
-    model_id = "sapientinc/HRM-Text-1B"
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        dtype=torch.bfloat16,
-    ).eval()
+    from utils import load_hrm
+
+    # A HF repo id / dir, or a native training checkpoint dir (auto-converted).
+    MODEL_SOURCE = "sapientinc/HRM-Text-1B"
+    model, tokenizer = load_hrm(MODEL_SOURCE, dtype=torch.bfloat16)
 
     print(model)
     logit_lens = LogitLens(tokenizer, model.lm_head, topk=1)
