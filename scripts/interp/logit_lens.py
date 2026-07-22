@@ -76,8 +76,13 @@ class LogitLens:
             self.captures.extend(captures)
         return hook
 
-    def show(self, captures=None, text=None):
-        """ Visualize a list of logit lens captures as a layer x position grid """
+    def show(self, captures=None, text=None, start_position=0):
+        """ Visualize a list of logit lens captures as a layer x position grid.
+
+        start_position: drop every column before this position index, e.g. pass the
+        prompt length to show only the generated tokens (positions keep their
+        absolute index, so the x-tick token labels stay aligned with `text`).
+        """
         if captures is None:
             captures = self.captures
         if not captures:
@@ -105,7 +110,7 @@ class LogitLens:
             passes[-1][1][c.position_idx] = c
             prev_layer, prev_pos = c.layer_name, c.position_idx
 
-        positions = sorted({c.position_idx for c in top1})
+        positions = sorted({c.position_idx for c in top1 if c.position_idx >= start_position})
 
         import numpy as np
         import matplotlib.pyplot as plt
@@ -167,6 +172,8 @@ if __name__ == "__main__":
 
     # A HF repo id / dir, or a native training checkpoint dir (auto-converted).
     MODEL_SOURCE = "sapientinc/HRM-Text-1B"
+    # If True, the heatmap drops the prompt columns and shows only generated tokens.
+    ONLY_GENERATED = True
     model, tokenizer = load_hrm(MODEL_SOURCE, dtype=torch.bfloat16)
 
     print(model)
@@ -192,6 +199,7 @@ if __name__ == "__main__":
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     # Mark the prompt as a single bidirectional prefix block — see "PrefixLM mask" below.
     inputs["token_type_ids"] = torch.ones_like(inputs["input_ids"])
+    prompt_len = inputs["input_ids"].shape[1]  # boundary between prefix and generated tokens
 
     print("Step 1: Generate text")
     with torch.no_grad():
@@ -202,7 +210,17 @@ if __name__ == "__main__":
     # Step 1.5 Re-encode
     prompt = decoded
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    inputs["token_type_ids"] = torch.ones_like(inputs["input_ids"])
+    # Reproduce the *generation-time* attention pattern so the captured activations
+    # match how the tokens were actually produced. During generation only the prompt
+    # was the bidirectional prefix (token_type_ids==1); every generated token was
+    # emitted under a causal mask (KV-cache decode ignores token_type_ids), seeing
+    # only the prefix + earlier generated tokens. Marking the whole sequence as
+    # prefix (all ones) would instead let each generated position attend *forward*
+    # to later generated tokens — activations the model never computed while
+    # generating. So: prefix = 1 for the original prompt, causal = 0 afterwards.
+    token_type_ids = torch.zeros_like(inputs["input_ids"])
+    token_type_ids[:, :prompt_len] = 1
+    inputs["token_type_ids"] = token_type_ids
 
     print("Step 2: Capturing logit lens outputs for the prompt + generated text")
     print("Prompt+Generated Text:", prompt)
@@ -211,4 +229,5 @@ if __name__ == "__main__":
             out = model.generate(**inputs, max_new_tokens=1, do_sample=False, use_cache=False)
 
     print("#Captures:", len(captures))
-    logit_lens.show(captures, text=prompt)
+    logit_lens.show(captures, text=prompt,
+                    start_position=prompt_len if ONLY_GENERATED else 0)

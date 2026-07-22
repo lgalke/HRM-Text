@@ -80,6 +80,32 @@ invocation as its own row.
 2. **`h_final` capture** = the exact `lm_head` input (post `H_module.final_norm`),
    grabbed via a `forward_pre_hook` on `model.lm_head`.
 
+## Readout mask — matching generation vs. matching the fit (`READOUT_MASK`)
+
+The demo readout re-encodes *prompt + generated continuation* and runs one
+capturing forward. Under PrefixLM (`token_type_ids==1` → one bidirectional block,
+`==0` → causal) there are two defensible attention patterns for that forward, and
+in `prefix` mode they differ — hence the `READOUT_MASK` knob:
+
+- **`"generation"` (default).** Only the original prompt is the bidirectional
+  prefix (`==1`); every generated token is causal (`==0`). This reproduces how the
+  tokens were actually produced — during KV-cache decode each generated token was
+  emitted under a causal mask, seeing only the prefix and earlier generated tokens,
+  never *forward* to later ones. So the captured activations are the ones the model
+  really computed while generating. This mirrors the fix in `logit_lens.py`.
+- **`"fit"`.** The whole sequence uses `MASK_MODE` (all `==1` in prefix mode), so
+  the activations are drawn from the *same* attention distribution the Jacobians
+  were fitted on. The transport operator is then applied to inputs of the kind it
+  was averaged over, but the activations no longer reflect how the tokens were
+  generated.
+
+There is an unavoidable asymmetry in `prefix` mode: `J` is fitted over corpus
+sequences that are *fully* bidirectional, whereas `"generation"` transports
+activations from a prefix/causal forward. `"generation"` prioritizes a faithful
+readout (what the model computed while generating); `"fit"` prioritizes a clean
+application of the transport (matching `J`'s fit distribution). In `causal` mode
+both collapse to left-to-right throughout, so the knob has no effect.
+
 ## Cost
 
 Fitting does ≈ `N_SEQS × ceil(d_model / DIM_BATCH)` backward passes through the
@@ -114,6 +140,7 @@ model baseline).
 |---|---|---|
 | `MODEL_SOURCE` | `sapientinc/HRM-Text-1B` | HF id/dir or native checkpoint dir |
 | `MASK_MODE` | `prefix` | `prefix` (token_type_ids=1) or `causal` |
+| `READOUT_MASK` | `generation` | demo readout mask: `generation` (prompt prefix, generated causal — faithful) or `fit` (whole sequence uses `MASK_MODE`); no effect in causal mode |
 | `DATASET` | `NeelNanda/c4-10k` | any `{split:"train","text"}` corpus |
 | `N_SEQS` | `128` | corpus size for fitting |
 | `SEQ_LEN` | `128` | tokens per corpus sequence |

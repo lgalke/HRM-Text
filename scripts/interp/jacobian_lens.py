@@ -427,10 +427,17 @@ if __name__ == "__main__":
     # ---- knobs --------------------------------------------------------------
     MODEL_SOURCE = "sapientinc/HRM-Text-1B"   # HF id/dir or native checkpoint dir
     MASK_MODE = "prefix"                       # "prefix" (default) or "causal"
+    # Readout attention pattern for the demo (only bites in prefix mode):
+    #   "generation" -- prompt is the bidirectional prefix, generated tokens causal,
+    #                   reproducing how the tokens were actually produced (faithful).
+    #   "fit"        -- whole sequence uses MASK_MODE, matching the distribution the
+    #                   Jacobians were fitted on (clean transport, but not how the
+    #                   tokens were generated). See jacobian_lens.md.
+    READOUT_MASK = "generation"                # "generation" (default) or "fit"
     DATASET = "NeelNanda/c4-10k"               # any {split:"train", "text"} corpus
     N_SEQS = 128                               # corpus size for fitting (Balanced)
     SEQ_LEN = 128                              # tokens per corpus sequence
-    DIM_BATCH = 16                             # VJP rows per backward (memory<->#passes)
+    DIM_BATCH = 4                              # VJP rows per backward (memory<->#passes)
     LAYER_IDS = [0, 7, 15]                     # which blocks to probe (as in logit_lens)
     LENS_CACHE = os.path.join(os.path.dirname(__file__), "jacobian_lens.pt")
 
@@ -476,6 +483,7 @@ if __name__ == "__main__":
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     inputs["token_type_ids"] = torch.ones_like(inputs["input_ids"]) \
         if MASK_MODE == "prefix" else torch.zeros_like(inputs["input_ids"])
+    prompt_len = inputs["input_ids"].shape[1]  # prefix/generated boundary
 
     print("Step 1: Generate a short continuation")
     with torch.inference_mode():
@@ -485,10 +493,21 @@ if __name__ == "__main__":
 
     # Re-encode prompt+generation and run one capturing forward (all positions
     # at once -- no generation loop needed for the layer x position grid).
+    # READOUT_MASK selects the attention pattern (only matters in prefix mode):
+    #   "generation" -- only the original prompt is the bidirectional prefix (==1);
+    #                   every generated token is causal (==0), as during KV-cache
+    #                   decode, so activations match how the tokens were produced.
+    #   "fit"        -- whole sequence uses MASK_MODE, matching the fit distribution.
+    # In causal mode both collapse to left-to-right throughout (all zeros).
     prompt = decoded
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    inputs["token_type_ids"] = torch.ones_like(inputs["input_ids"]) \
-        if MASK_MODE == "prefix" else torch.zeros_like(inputs["input_ids"])
+    if MASK_MODE == "prefix" and READOUT_MASK == "fit":
+        token_type_ids = torch.ones_like(inputs["input_ids"])
+    else:
+        token_type_ids = torch.zeros_like(inputs["input_ids"])
+        if MASK_MODE == "prefix":  # READOUT_MASK == "generation"
+            token_type_ids[:, :prompt_len] = 1
+    inputs["token_type_ids"] = token_type_ids
 
     print("Step 2: Capturing Jacobian-lens readout")
     with torch.inference_mode():
