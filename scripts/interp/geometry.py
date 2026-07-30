@@ -1,7 +1,7 @@
 import torch
 
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Sequence
+from typing import List, Dict, Optional, Sequence, Tuple
 
 
 @dataclass
@@ -253,15 +253,16 @@ class GeometryProbe:
 # --------------------------------------------------------------------------
 @torch.inference_mode()
 def generate_sequences(model, tokenizer, prompts, batch_size=8,
-                       max_new_tokens=64, device="cpu") -> List[torch.Tensor]:
-    """Batch-generate completions and return one 1-D token-id tensor per prompt
-    (prompt + generation, padding stripped)."""
+                       max_new_tokens=64, device="cpu") -> List[Tuple[torch.Tensor, int]]:
+    """Batch-generate completions and return one `(ids, prompt_len)` per prompt:
+    a 1-D token-id tensor (prompt + generation, padding stripped) and how many of
+    its leading tokens are the prompt (the bidirectional-prefix boundary)."""
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"  # decoder-only generation needs left padding
     pad_id = tokenizer.pad_token_id
 
-    seqs: List[torch.Tensor] = []
+    seqs: List[Tuple[torch.Tensor, int]] = []
     for i in range(0, len(prompts), batch_size):
         chunk = prompts[i:i + batch_size]
         enc = tokenizer(chunk, return_tensors="pt", padding=True).to(device)
@@ -270,32 +271,47 @@ def generate_sequences(model, tokenizer, prompts, batch_size=8,
         for k in range(len(chunk)):
             row = out[k]
             left_pad = int((enc["attention_mask"][k] == 0).sum())  # leading pads
+            prompt_len = int(enc["attention_mask"][k].sum())       # real prompt tokens
             ids = row[left_pad:]                                   # prompt + generation
             nonpad = (ids != pad_id).nonzero()                    # strip trailing pads
             if nonpad.numel():
                 ids = ids[: int(nonpad[-1]) + 1]
-            seqs.append(ids.detach().cpu())
+            seqs.append((ids.detach().cpu(), prompt_len))
     return seqs
 
 
-def build_batches(seqs: Sequence[torch.Tensor], pad_id: int, batch_size=8,
-                  sort_by_length=True) -> List[Dict[str, torch.Tensor]]:
-    """Right-pad sequences into measurement batches. token_type_ids is all-ones
-    on real tokens (whole sequence treated as a bidirectional prefix, matching
-    the measurement convention). Length-sorting cuts padding waste."""
-    order = sorted(range(len(seqs)), key=lambda i: seqs[i].numel()) if sort_by_length \
+def build_batches(seqs: Sequence[Tuple[torch.Tensor, int]], pad_id: int, batch_size=8,
+                  sort_by_length=True, readout_mask="generation") -> List[Dict[str, torch.Tensor]]:
+    """Right-pad `(ids, prompt_len)` sequences into measurement batches.
+
+    `readout_mask` sets the attention pattern the geometry is measured under:
+      "generation" -- only the prompt is the bidirectional prefix (token_type_ids
+                      ==1); the generated tail is causal (==0). This reproduces how
+                      the tokens were actually produced (each generated token saw
+                      only the prefix + earlier tokens during causal decode), so the
+                      per-block geometry reflects the model's generation-time compute.
+      "prefix"     -- whole sequence bidirectional (all real tokens ==1). Simpler,
+                      but generated tokens then attend forward to tokens they never
+                      saw while being generated.
+    Length-sorting cuts padding waste."""
+    order = sorted(range(len(seqs)), key=lambda i: seqs[i][0].numel()) if sort_by_length \
         else list(range(len(seqs)))
     batches = []
     for i in range(0, len(order), batch_size):
         idx = order[i:i + batch_size]
-        L = max(seqs[j].numel() for j in idx)
+        L = max(seqs[j][0].numel() for j in idx)
         ids = torch.full((len(idx), L), pad_id, dtype=torch.long)
         am = torch.zeros((len(idx), L), dtype=torch.long)
+        tt = torch.zeros((len(idx), L), dtype=torch.long)
         for r, j in enumerate(idx):
-            s = seqs[j]
+            s, prompt_len = seqs[j]
             ids[r, : s.numel()] = s
             am[r, : s.numel()] = 1
-        batches.append(dict(input_ids=ids, attention_mask=am, token_type_ids=am.clone()))
+            # Prefix span: the whole real sequence, or just the prompt if we want
+            # the generated tail to stay causal (as it was during generation).
+            prefix_end = s.numel() if readout_mask == "prefix" else min(prompt_len, s.numel())
+            tt[r, :prefix_end] = 1
+        batches.append(dict(input_ids=ids, attention_mask=am, token_type_ids=tt))
     return batches
 
 
@@ -304,6 +320,11 @@ if __name__ == "__main__":
 
     # A HF repo id / dir, or a native training checkpoint dir (auto-converted).
     MODEL_SOURCE = "sapientinc/HRM-Text-1B"
+    # Attention pattern the geometry is measured under (see build_batches):
+    #   "generation" -- prompt is the prefix, generated tail causal (faithful to
+    #                   how the tokens were produced); "prefix" -- whole sequence
+    #                   bidirectional (generated tokens see the future).
+    READOUT_MASK = "generation"
     device = "cuda" if torch.cuda.is_available() else \
              ("mps" if torch.backends.mps.is_available() else "cpu")
     model, tokenizer = load_hrm(MODEL_SOURCE, dtype=torch.bfloat16, device=device)
@@ -345,7 +366,8 @@ if __name__ == "__main__":
                               max_new_tokens=32, device=device)
 
     print("Stage B: batched forward passes + streaming geometry")
-    batches = build_batches(seqs, pad_id=tokenizer.pad_token_id, batch_size=4)
+    batches = build_batches(seqs, pad_id=tokenizer.pad_token_id, batch_size=4,
+                            readout_mask=READOUT_MASK)
     stats = geometry.measure(model, batches, device=device)
 
     print(f"#Layer applications: {len(stats)}  (n={stats[0].n} sequences each)")
